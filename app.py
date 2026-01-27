@@ -9,11 +9,13 @@ from requests.auth import HTTPBasicAuth
 
 RTT_BASE = "https://api.rtt.io/api/v1"
 
+
 # ----------------------------
-# Column utilities
+# Small utilities
 # ----------------------------
 def key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
 
 def find_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     cols = list(df.columns)
@@ -31,17 +33,19 @@ def find_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
                 return c
     return None
 
+
 def norm_name(s: str) -> str:
     s = str(s).strip().lower()
     s = re.sub(r"[^a-z0-9 ]+", "", s)
     s = re.sub(r"\s+", " ", s)
     return s
 
+
 # ----------------------------
 # Time normalisation
 # ----------------------------
 def parse_pass_hhmm(x) -> Optional[str]:
-    """PASS no-brand rows are GBTT/public, in HH:MM (with colon)."""
+    """PASS file times are GBTT/public in HH:MM (with colon)."""
     if pd.isna(x):
         return None
     s = str(x).strip()
@@ -55,9 +59,10 @@ def parse_pass_hhmm(x) -> Optional[str]:
         return f"{hh:02d}:{mm:02d}"
     return None
 
+
 def rtt_public_to_hhmm(x) -> Optional[str]:
     """
-    RTT public timetable fields are commonly HHmm (e.g. 1503).
+    RTT public timetable fields typically HHmm (e.g. 1503).
     Convert to HH:MM. If HHmmss appears, truncate to HH:MM.
     """
     if x is None or (isinstance(x, float) and pd.isna(x)):
@@ -72,32 +77,36 @@ def rtt_public_to_hhmm(x) -> Optional[str]:
         return f"{s[:2]}:{s[2:4]}"
     return None
 
-# ----------------------------
-# Days run parsing
-# ----------------------------
-# Railway tokens you mentioned
-RAIL_TOKENS = {"MO": 0, "TO": 1, "WO": 2, "THO": 3, "FO": 4, "SO": 5, "SU": 6}
 
-# Timetable-letter shorthand used in codes like SX, MSX, TWO, TWFO
-DAY_LETTERS = {
-    "M": 0,  # Mon
-    "T": 1,  # Tue
-    "W": 2,  # Wed
-    "H": 3,  # Thu (often H)
-    "R": 3,  # Thu (alt)
-    "F": 4,  # Fri
-    "S": 5,  # Sat
-    "U": 6,  # Sun (often U)
-}
-
+# ----------------------------
+# Days run parsing (your timetable key)
+# ----------------------------
 def parse_journey_days_run(value) -> Set[int]:
     """
-    Supports:
-      A) Railway day codes: SO, Su, MO, TO, WO, ThO, FO and combinations
-      B) Variations: SX, MSX, TWO, TWFO etc with O/X rules:
-         - O => ONLY those days listed
-         - X => EXCEPT those days listed (base = Mon-Sun)
-    Returns weekday indices Mon=0..Sun=6
+    Timetable key:
+      M  Monday
+      T  Tuesday
+      W  Wednesday
+      Th Thursday
+      F  Friday
+      S  Saturday
+      Su Sunday
+
+    Suffix rules:
+      - ...O => runs ONLY on the day(s) preceding the O
+      - ...X => runs on ALL days in the section EXCEPT the day(s) preceding the X
+
+    Examples:
+      MSX => except Monday & Saturday
+      FSX => except Friday & Saturday
+      TWO => only Tue & Wed
+      SX  => except Saturday
+      ThO => only Thursday
+      SuO => only Sunday
+
+    Also supports railway-style tokens as fallback:
+      MO TO WO ThO FO SO Su (and combinations)
+    Returns weekday indexes Mon=0..Sun=6.
     """
     if pd.isna(value):
         return set()
@@ -105,50 +114,86 @@ def parse_journey_days_run(value) -> Set[int]:
     if not raw:
         return set()
 
-    up = raw.upper().replace("TH0", "THO")
-
-    # A) railway tokens (MO/TO/WO/THO/FO/SO/SU)
-    tokens = re.split(r"[,\s;/]+", up)
-    tokens = [t for t in tokens if t]
-
+    # --- 1) Fallback: railway-style tokens (MO/TO/WO/ThO/FO/SO/Su) ---
+    rail_map = {"MO": 0, "TO": 1, "WO": 2, "THO": 3, "FO": 4, "SO": 5, "SU": 6}
+    tokens = re.split(r"[,\s;/]+", raw, flags=re.IGNORECASE)
     rail_days = set()
     for t in tokens:
-        t2 = t.strip().upper()
-        if t2 == "SU":
+        t = t.strip()
+        if not t:
+            continue
+        t_up = t.upper().replace("TH0", "THO")
+        # normalise "Su" -> "SU"
+        if t_up == "SU":
             rail_days.add(6)
-        elif t2 in RAIL_TOKENS:
-            rail_days.add(RAIL_TOKENS[t2])
+        elif t_up in rail_map:
+            rail_days.add(rail_map[t_up])
     if rail_days:
         return rail_days
 
-    # B) shorthand (letters) with optional O/X
-    blob = re.sub(r"[^A-Z]", "", up)
-    only_mode = "O" in blob
-    except_mode = "X" in blob
-    blob = blob.replace("O", "").replace("X", "")
+    # --- 2) Timetable key codes: M/T/W/Th/F/S/Su + optional O/X suffix ---
+    blob = re.sub(r"[\s,;/]+", "", raw)  # remove separators
+    if not blob:
+        return set()
 
-    days = set()
-    for ch in blob:
-        if ch in DAY_LETTERS:
-            days.add(DAY_LETTERS[ch])
+    mode = None
+    if blob[-1].upper() in ("O", "X"):
+        mode = blob[-1].upper()
+        blob = blob[:-1]  # day(s) preceding suffix
 
-    if except_mode:
-        base = set(range(7))  # Mon–Sun
+    # Parse day tokens in order, preferring 2-letter tokens first (Th, Su)
+    i = 0
+    days: Set[int] = set()
+    while i < len(blob):
+        part2 = blob[i:i+2]
+        part1 = blob[i:i+1]
+
+        if part2.lower() == "th":
+            days.add(3)
+            i += 2
+            continue
+        if part2.lower() == "su":
+            days.add(6)
+            i += 2
+            continue
+
+        ch = part1.upper()
+        if ch == "M":
+            days.add(0)
+        elif ch == "T":
+            days.add(1)
+        elif ch == "W":
+            days.add(2)
+        elif ch == "F":
+            days.add(4)
+        elif ch == "S":
+            days.add(5)
+        # unknown chars ignored
+        i += 1
+
+    if mode == "O":
+        return days  # ONLY those days
+
+    if mode == "X":
+        base = set(range(7))  # Mon..Sun (timetable section base)
         return base - days if days else base
 
-    # only_mode or plain list => just those days
     return days
+
 
 # ----------------------------
 # RailReferences
 # ----------------------------
 @st.cache_data
 def load_railrefs_from_repo(path: str) -> pd.DataFrame:
+    # RailReferences.csv: TIPLOC, CRS, Description (no header)
     return pd.read_csv(path, header=None, names=["tiploc", "crs", "description"])
+
 
 @st.cache_data
 def load_railrefs_from_upload(uploaded) -> pd.DataFrame:
     return pd.read_csv(uploaded, header=None, names=["tiploc", "crs", "description"])
+
 
 def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
     d: Dict[str, str] = {}
@@ -158,7 +203,7 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
         if desc and crs and desc not in d:
             d[desc] = crs
 
-    # small alias helpers (extend if needed)
+    # Minimal aliases (extend if needed)
     aliases = {
         "kings cross": "KGX",
         "london kings cross": "KGX",
@@ -170,8 +215,9 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
         d.setdefault(norm_name(k), v)
     return d
 
+
 # ----------------------------
-# RTT calls (public times only)
+# RTT calls (public/GBTT only)
 # ----------------------------
 def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasicAuth) -> dict:
     y = run_date.year
@@ -181,6 +227,7 @@ def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasic
     r = requests.get(url, auth=auth, timeout=30)
     r.raise_for_status()
     return r.json()
+
 
 def flatten_location_services(payload: dict) -> pd.DataFrame:
     services = payload.get("services", []) or []
@@ -193,10 +240,15 @@ def flatten_location_services(payload: dict) -> pd.DataFrame:
             "runDate": s.get("runDate"),
             "operator": s.get("atocName") or "",
             "plannedCancel": bool(s.get("plannedCancel", False)),
-            # Public/GBTT departure from this origin location
+            # Public departure at this origin
             "pub_dep_raw": ld.get("gbttBookedDeparture") or ld.get("publicTime") or ld.get("realtimeDeparture"),
         })
-    return pd.DataFrame(rows)
+
+    # Always return expected columns, even if zero rows
+    return pd.DataFrame(rows, columns=[
+        "trainIdentity", "serviceUid", "runDate", "operator", "plannedCancel", "pub_dep_raw"
+    ])
+
 
 def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth) -> dict:
     url = f"{RTT_BASE}/json/service/{service_uid}/{run_date_iso}"
@@ -204,16 +256,16 @@ def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth)
     r.raise_for_status()
     return r.json()
 
-def extract_origin_dest_public(payload: dict) -> dict:
+
+def extract_dest_public(payload: dict) -> dict:
     """
-    Extract origin/destination names and PUBLIC times.
-    Prefer GBTT/public fields; ignore working/WTT.
+    Extract destination name and public arrival.
+    Prefer GBTT/public fields; ignore WTT/working.
     """
     locs = payload.get("locations", []) or []
     if not locs:
-        return {"origin_name": None, "dest_name": None, "arr_pub_raw": None}
+        return {"dest_name": None, "arr_pub_raw": None}
 
-    origin = locs[0]
     dest = locs[-1]
 
     def pick_arr(loc) -> Optional[str]:
@@ -221,21 +273,25 @@ def extract_origin_dest_public(payload: dict) -> dict:
         return ld.get("gbttBookedArrival") or ld.get("publicTime") or ld.get("realtimeArrival")
 
     return {
-        "origin_name": origin.get("description"),
         "dest_name": dest.get("description"),
         "arr_pub_raw": pick_arr(dest),
     }
+
 
 @st.cache_data(ttl=300)
 def cached_location_search(crs: str, run_date: dt.date, user: str, pw: str) -> dict:
     return rtt_location_services(crs, run_date, HTTPBasicAuth(user, pw))
 
+
 # ----------------------------
-# Streamlit UI
+# Streamlit app
 # ----------------------------
 st.set_page_config(page_title="RTT No-Brand Checker", layout="wide")
 st.title("RTT No-Brand Checker")
-st.caption("Checks PASS trips where Brand is blank. Expected run dates derived from selected date range + JourneyDays Run. Times are public/GBTT only (exact match).")
+st.caption(
+    "Checks PASS trips where Brand is blank. Expected run dates derived from selected date range + JourneyDays Run. "
+    "Times are public/GBTT only (exact HH:MM match)."
+)
 
 # Secrets
 rtt_user = st.secrets.get("RTT_USER", "")
@@ -259,7 +315,7 @@ with st.sidebar:
 
 DEFAULT_RAILREFS_PATH = "RailReferences.csv"
 
-# Load RailReferences default, override optionally
+# Load RailReferences (cached)
 if update_refs:
     uploaded_refs = st.file_uploader("Upload RailReferences.csv (override)", type=["csv"], key="railrefs_upload")
     if not uploaded_refs:
@@ -271,7 +327,11 @@ else:
     try:
         rail_refs = load_railrefs_from_repo(DEFAULT_RAILREFS_PATH)
     except Exception as e:
-        st.error(f"Couldn't load '{DEFAULT_RAILREFS_PATH}' from the repo. Tick 'Update RailReferences now' and upload it. Details: {e}")
+        st.error(
+            f"Couldn't load '{DEFAULT_RAILREFS_PATH}' from the repo. "
+            "Tick 'Update RailReferences now' and upload it. "
+            f"Details: {e}"
+        )
         st.stop()
 
 desc_to_crs = build_desc_to_crs(rail_refs)
@@ -280,13 +340,13 @@ if not pass_file:
     st.info("Upload pass-trips.csv to begin.")
     st.stop()
 
-# Load pass-trips (metadata first 3 rows, headers in row 4)
+# PASS file: metadata first 3 rows, headers in row 4
 df = pd.read_csv(pass_file, skiprows=3)
 
 with st.expander("Debug: detected columns in pass-trips.csv"):
     st.write(list(df.columns))
 
-# Detect columns
+# Required columns
 col_brand = find_col(df, "Brand")
 col_headcode = find_col(df, "Headcode")
 col_origin = find_col(df, "JourneyOrigin", "Journey Origin", "Origin")
@@ -330,7 +390,7 @@ if missing:
 # Brand blank only
 df_nb = df[df[col_brand].isna() | (df[col_brand].astype(str).str.strip() == "")].copy()
 
-# Parse essential fields
+# Parse fields needed for checking
 df_nb["dep_hhmm"] = df_nb[col_dep].apply(parse_pass_hhmm)
 df_nb["arr_hhmm"] = df_nb[col_arr].apply(parse_pass_hhmm)
 df_nb["jdays_set"] = df_nb[col_jdays].apply(parse_journey_days_run)
@@ -345,15 +405,20 @@ with st.expander("Preview (Brand blank only)"):
     base_cols = [col_headcode, col_origin, col_dest, col_dep, col_arr, col_jdays]
     diag_cols = [c for c in [col_resource, col_plan_type, col_depot, col_did, col_ddays] if c]
     show_cols = list(dict.fromkeys(base_cols + diag_cols))
-    st.dataframe(df_nb[show_cols + ["origin_crs", "dest_crs", "dep_hhmm", "arr_hhmm"]], use_container_width=True)
+    st.dataframe(
+        df_nb[show_cols + ["origin_crs", "dest_crs", "dep_hhmm", "arr_hhmm", "jdays_set"]],
+        use_container_width=True
+    )
 
 with st.expander("Debug: JourneyDays Run values (top 40)"):
     st.write(df_nb[col_jdays].astype(str).value_counts().head(40))
 
-# Build expected checks per date range + JourneyDays Run
+# Build expected checks per selected date range + JourneyDays Run
 expected_rows: List[dict] = []
-for d in (date_from + dt.timedelta(days=i) for i in range((date_to - date_from).days + 1)):
+for i in range((date_to - date_from).days + 1):
+    d = date_from + dt.timedelta(days=i)
     wd = d.weekday()  # Mon=0..Sun=6
+
     subset = df_nb[df_nb["jdays_set"].apply(lambda s: wd in s if isinstance(s, set) else False)]
     if subset.empty:
         continue
@@ -366,7 +431,6 @@ for d in (date_from + dt.timedelta(days=i) for i in range((date_to - date_from).
         did = str(r[col_did]).strip() if col_did else ""
         ddays = str(r[col_ddays]).strip() if col_ddays else ""
 
-        diagram_info = ""
         if resource or plan:
             diagram_info = f'{resource} - {plan} {depot}.{did} {ddays}'.strip()
         else:
@@ -412,6 +476,7 @@ grouped = expected.groupby(["date", "origin_crs"], dropna=False)
 for (date_iso, origin_crs), grp in grouped:
     run_date = dt.date.fromisoformat(date_iso)
 
+    # CRS missing -> not checked
     if not isinstance(origin_crs, str) or not origin_crs.strip():
         for _, row in grp.iterrows():
             results.append({
@@ -425,6 +490,7 @@ for (date_iso, origin_crs), grp in grouped:
             progress.progress(min(1.0, done / total))
         continue
 
+    # RTT location search
     try:
         payload = cached_location_search(origin_crs.strip(), run_date, rtt_user, rtt_pass)
         loc_df = flatten_location_services(payload)
@@ -434,6 +500,20 @@ for (date_iso, origin_crs), grp in grouped:
                 **row.to_dict(),
                 "status": "FAIL",
                 "error": f"RTT location query failed: {ex}",
+                "operator": "",
+                "planned_cancel": "",
+            })
+            done += 1
+            progress.progress(min(1.0, done / total))
+        continue
+
+    # Empty services list -> fail each row in the group (but never crash)
+    if loc_df.empty:
+        for _, row in grp.iterrows():
+            results.append({
+                **row.to_dict(),
+                "status": "FAIL",
+                "error": f"No RTT services returned for origin/date (origin CRS: {origin_crs})",
                 "operator": "",
                 "planned_cancel": "",
             })
@@ -460,7 +540,7 @@ for (date_iso, origin_crs), grp in grouped:
             progress.progress(min(1.0, done / total))
             continue
 
-        # Departure time match (public, exact HH:MM)
+        # Departure match (public, exact HH:MM)
         if exp_dep:
             candidates["dep_pub_hhmm"] = candidates["pub_dep_raw"].apply(rtt_public_to_hhmm)
             candidates = candidates[candidates["dep_pub_hhmm"] == exp_dep]
@@ -494,10 +574,10 @@ for (date_iso, origin_crs), grp in grouped:
             progress.progress(min(1.0, done / total))
             continue
 
-        # Service detail to confirm destination + arrival time (public)
+        # Service detail: destination + public arrival
         try:
             detail = rtt_service_detail(uid, rtt_run_date, auth)
-            det = extract_origin_dest_public(detail)
+            det = extract_dest_public(detail)
         except Exception:
             results.append({
                 **row.to_dict(),
@@ -512,6 +592,7 @@ for (date_iso, origin_crs), grp in grouped:
 
         det_dest = det.get("dest_name") or ""
         if exp_to and det_dest:
+            # name-based match (simple and transparent)
             if norm_name(exp_to) not in norm_name(det_dest) and norm_name(det_dest) not in norm_name(exp_to):
                 results.append({
                     **row.to_dict(),
@@ -569,7 +650,10 @@ else:
 
 with st.expander("Trains running as booked (simplified)"):
     simp = ok.copy()
-    simp["line"] = simp.apply(lambda r: f"{r['date']} {r['headcode']} {r['dep']} {r['from']} - {r['to']} {r['arr']}", axis=1)
+    simp["line"] = simp.apply(
+        lambda r: f"{r['date']} {r['headcode']} {r['dep']} {r['from']} - {r['to']} {r['arr']}",
+        axis=1
+    )
     lines = simp.sort_values(["date", "dep", "headcode"])["line"].tolist()
     st.write("\n".join(lines) if lines else "None")
 
