@@ -11,7 +11,7 @@ RTT_BASE = "https://api.rtt.io/api/v1"
 
 
 # ----------------------------
-# Small utilities
+# Utilities
 # ----------------------------
 def key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
@@ -20,12 +20,10 @@ def key(s: str) -> str:
 def find_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     cols = list(df.columns)
     km = {key(c): c for c in cols}
-
     for w in candidates:
         kw = key(w)
         if kw in km:
             return km[kw]
-
     for w in candidates:
         kw = key(w)
         for c in cols:
@@ -71,9 +69,9 @@ def rtt_public_to_hhmm(x) -> Optional[str]:
     if not s or s.lower() == "null":
         return None
     s = re.sub(r"\D", "", s)
-    if len(s) == 4:      # HHmm
+    if len(s) == 4:  # HHmm
         return f"{s[:2]}:{s[2:]}"
-    if len(s) == 6:      # HHmmss -> HH:MM
+    if len(s) == 6:  # HHmmss -> HH:MM
         return f"{s[:2]}:{s[2:4]}"
     return None
 
@@ -102,7 +100,7 @@ def parse_journey_days_run(value) -> Set[int]:
       TWO => only Tue & Wed
       SX  => except Saturday
       ThO => only Thursday
-      SuO => only Sunday
+      Su => only Sunday
 
     Also supports railway-style tokens as fallback:
       MO TO WO ThO FO SO Su (and combinations)
@@ -114,7 +112,7 @@ def parse_journey_days_run(value) -> Set[int]:
     if not raw:
         return set()
 
-    # --- 1) Fallback: railway-style tokens (MO/TO/WO/ThO/FO/SO/Su) ---
+    # 1) Fallback: railway tokens
     rail_map = {"MO": 0, "TO": 1, "WO": 2, "THO": 3, "FO": 4, "SO": 5, "SU": 6}
     tokens = re.split(r"[,\s;/]+", raw, flags=re.IGNORECASE)
     rail_days = set()
@@ -123,7 +121,6 @@ def parse_journey_days_run(value) -> Set[int]:
         if not t:
             continue
         t_up = t.upper().replace("TH0", "THO")
-        # normalise "Su" -> "SU"
         if t_up == "SU":
             rail_days.add(6)
         elif t_up in rail_map:
@@ -131,22 +128,21 @@ def parse_journey_days_run(value) -> Set[int]:
     if rail_days:
         return rail_days
 
-    # --- 2) Timetable key codes: M/T/W/Th/F/S/Su + optional O/X suffix ---
-    blob = re.sub(r"[\s,;/]+", "", raw)  # remove separators
+    # 2) Timetable key codes
+    blob = re.sub(r"[\s,;/]+", "", raw)
     if not blob:
         return set()
 
     mode = None
     if blob[-1].upper() in ("O", "X"):
         mode = blob[-1].upper()
-        blob = blob[:-1]  # day(s) preceding suffix
+        blob = blob[:-1]
 
-    # Parse day tokens in order, preferring 2-letter tokens first (Th, Su)
     i = 0
     days: Set[int] = set()
     while i < len(blob):
-        part2 = blob[i:i+2]
-        part1 = blob[i:i+1]
+        part2 = blob[i:i + 2]
+        part1 = blob[i:i + 1]
 
         if part2.lower() == "th":
             days.add(3)
@@ -168,16 +164,13 @@ def parse_journey_days_run(value) -> Set[int]:
             days.add(4)
         elif ch == "S":
             days.add(5)
-        # unknown chars ignored
         i += 1
 
     if mode == "O":
-        return days  # ONLY those days
-
+        return days
     if mode == "X":
-        base = set(range(7))  # Mon..Sun (timetable section base)
+        base = set(range(7))  # Mon..Sun
         return base - days if days else base
-
     return days
 
 
@@ -203,7 +196,7 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
         if desc and crs and desc not in d:
             d[desc] = crs
 
-    # Minimal aliases (extend if needed)
+    # minimal aliases (extend if needed)
     aliases = {
         "kings cross": "KGX",
         "london kings cross": "KGX",
@@ -217,7 +210,7 @@ def build_desc_to_crs(rail_refs: pd.DataFrame) -> Dict[str, str]:
 
 
 # ----------------------------
-# RTT calls (public/GBTT only)
+# RTT calls (public/GBTT)
 # ----------------------------
 def rtt_location_services(crs_or_tiploc: str, run_date: dt.date, auth: HTTPBasicAuth) -> dict:
     y = run_date.year
@@ -240,14 +233,9 @@ def flatten_location_services(payload: dict) -> pd.DataFrame:
             "runDate": s.get("runDate"),
             "operator": s.get("atocName") or "",
             "plannedCancel": bool(s.get("plannedCancel", False)),
-            # Public departure at this origin
             "pub_dep_raw": ld.get("gbttBookedDeparture") or ld.get("publicTime") or ld.get("realtimeDeparture"),
         })
-
-    # Always return expected columns, even if zero rows
-    return pd.DataFrame(rows, columns=[
-        "trainIdentity", "serviceUid", "runDate", "operator", "plannedCancel", "pub_dep_raw"
-    ])
+    return pd.DataFrame(rows, columns=["trainIdentity", "serviceUid", "runDate", "operator", "plannedCancel", "pub_dep_raw"])
 
 
 def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth) -> dict:
@@ -257,24 +245,47 @@ def rtt_service_detail(service_uid: str, run_date_iso: str, auth: HTTPBasicAuth)
     return r.json()
 
 
-def extract_dest_public(payload: dict) -> dict:
-    """
-    Extract destination name and public arrival.
-    Prefer GBTT/public fields; ignore WTT/working.
-    """
-    locs = payload.get("locations", []) or []
-    if not locs:
-        return {"dest_name": None, "arr_pub_raw": None}
+def loc_matches(pass_name: str, rtt_desc: str) -> bool:
+    a = norm_name(pass_name)
+    b = norm_name(rtt_desc)
+    return a == b or a in b or b in a
 
-    dest = locs[-1]
 
-    def pick_arr(loc) -> Optional[str]:
+def extract_segment_times(detail_payload: dict, pass_from: str, pass_to: str) -> dict:
+    """
+    Find PASS FROM and TO *within the RTT service calling points* and return public dep/arr there.
+    This avoids the common mistake of using the final destination for comparisons.
+    """
+    locs = detail_payload.get("locations", []) or []
+
+    from_idx = None
+    to_idx = None
+    from_desc = None
+    to_desc = None
+    from_dep_raw = None
+    to_arr_raw = None
+
+    for i, loc in enumerate(locs):
+        desc = loc.get("description") or ""
         ld = loc.get("locationDetail") or {}
-        return ld.get("gbttBookedArrival") or ld.get("publicTime") or ld.get("realtimeArrival")
+
+        if from_idx is None and loc_matches(pass_from, desc):
+            from_idx = i
+            from_desc = desc
+            from_dep_raw = ld.get("gbttBookedDeparture") or ld.get("publicTime") or ld.get("realtimeDeparture")
+
+        if from_idx is not None and i >= from_idx and to_idx is None and loc_matches(pass_to, desc):
+            to_idx = i
+            to_desc = desc
+            to_arr_raw = ld.get("gbttBookedArrival") or ld.get("publicTime") or ld.get("realtimeArrival")
 
     return {
-        "dest_name": dest.get("description"),
-        "arr_pub_raw": pick_arr(dest),
+        "from_found": from_idx is not None,
+        "to_found": to_idx is not None,
+        "act_from": from_desc,
+        "act_to": to_desc,
+        "act_dep": rtt_public_to_hhmm(from_dep_raw),
+        "act_arr": rtt_public_to_hhmm(to_arr_raw),
     }
 
 
@@ -290,7 +301,7 @@ st.set_page_config(page_title="RTT No-Brand Checker", layout="wide")
 st.title("RTT No-Brand Checker")
 st.caption(
     "Checks PASS trips where Brand is blank. Expected run dates derived from selected date range + JourneyDays Run. "
-    "Times are public/GBTT only (exact HH:MM match)."
+    "Compares public/GBTT times (exact HH:MM) at the PASS FROM/TO calling points within RTT service detail."
 )
 
 # Secrets
@@ -315,7 +326,7 @@ with st.sidebar:
 
 DEFAULT_RAILREFS_PATH = "RailReferences.csv"
 
-# Load RailReferences (cached)
+# Load RailReferences
 if update_refs:
     uploaded_refs = st.file_uploader("Upload RailReferences.csv (override)", type=["csv"], key="railrefs_upload")
     if not uploaded_refs:
@@ -391,12 +402,10 @@ if missing:
 df_nb = df[df[col_brand].isna() | (df[col_brand].astype(str).str.strip() == "")].copy()
 
 # Parse fields needed for checking
-df_nb["dep_hhmm"] = df_nb[col_dep].apply(parse_pass_hhmm)
-df_nb["arr_hhmm"] = df_nb[col_arr].apply(parse_pass_hhmm)
+df_nb["exp_dep"] = df_nb[col_dep].apply(parse_pass_hhmm)
+df_nb["exp_arr"] = df_nb[col_arr].apply(parse_pass_hhmm)
 df_nb["jdays_set"] = df_nb[col_jdays].apply(parse_journey_days_run)
-
 df_nb["origin_crs"] = df_nb[col_origin].apply(lambda x: desc_to_crs.get(norm_name(x)))
-df_nb["dest_crs"] = df_nb[col_dest].apply(lambda x: desc_to_crs.get(norm_name(x)))
 
 st.subheader("Input summary (Brand blank only)")
 st.write(f"Rows: **{len(df_nb)}** | Unique headcodes: **{df_nb[col_headcode].nunique()}**")
@@ -406,7 +415,7 @@ with st.expander("Preview (Brand blank only)"):
     diag_cols = [c for c in [col_resource, col_plan_type, col_depot, col_did, col_ddays] if c]
     show_cols = list(dict.fromkeys(base_cols + diag_cols))
     st.dataframe(
-        df_nb[show_cols + ["origin_crs", "dest_crs", "dep_hhmm", "arr_hhmm", "jdays_set"]],
+        df_nb[show_cols + ["origin_crs", "exp_dep", "exp_arr", "jdays_set"]],
         use_container_width=True
     )
 
@@ -430,7 +439,6 @@ for i in range((date_to - date_from).days + 1):
         depot = str(r[col_depot]).strip() if col_depot else ""
         did = str(r[col_did]).strip() if col_did else ""
         ddays = str(r[col_ddays]).strip() if col_ddays else ""
-
         if resource or plan:
             diagram_info = f'{resource} - {plan} {depot}.{did} {ddays}'.strip()
         else:
@@ -439,12 +447,11 @@ for i in range((date_to - date_from).days + 1):
         expected_rows.append({
             "date": d.isoformat(),
             "headcode": str(r[col_headcode]).strip(),
-            "from": str(r[col_origin]).strip(),
-            "to": str(r[col_dest]).strip(),
-            "dep": r["dep_hhmm"],
-            "arr": r["arr_hhmm"],
+            "exp_from": str(r[col_origin]).strip(),
+            "exp_to": str(r[col_dest]).strip(),
+            "exp_dep": r["exp_dep"],
+            "exp_arr": r["exp_arr"],
             "origin_crs": r["origin_crs"],
-            "dest_crs": r["dest_crs"],
             "diagram_info": diagram_info,
         })
 
@@ -458,204 +465,299 @@ if expected.empty:
     st.stop()
 
 run = st.button("Run RTT check", type="primary")
-if not run:
+
+# If we already have a report, let user download without re-run
+existing_report = st.session_state.get("report")
+
+if not run and existing_report is None:
     st.stop()
 
-if not auth:
-    st.error("RTT credentials missing. Add RTT_USER/RTT_PASS in Streamlit Cloud Secrets.")
-    st.stop()
+if run:
+    if not auth:
+        st.error("RTT credentials missing. Add RTT_USER/RTT_PASS in Streamlit Cloud Secrets.")
+        st.stop()
 
-# Perform checks (grouped by date + origin CRS)
-results: List[dict] = []
-total = len(expected)
-done = 0
-progress = st.progress(0)
+    results: List[dict] = []
+    total = len(expected)
+    done = 0
+    progress = st.progress(0)
 
-grouped = expected.groupby(["date", "origin_crs"], dropna=False)
+    grouped = expected.groupby(["date", "origin_crs"], dropna=False)
 
-for (date_iso, origin_crs), grp in grouped:
-    run_date = dt.date.fromisoformat(date_iso)
+    for (date_iso, origin_crs), grp in grouped:
+        run_date = dt.date.fromisoformat(date_iso)
 
-    # CRS missing -> not checked
-    if not isinstance(origin_crs, str) or not origin_crs.strip():
-        for _, row in grp.iterrows():
-            results.append({
-                **row.to_dict(),
-                "status": "NOT CHECKED",
-                "error": "Origin CRS not mapped (RailReferences missing mapping / add alias)",
-                "operator": "",
-                "planned_cancel": "",
-            })
-            done += 1
-            progress.progress(min(1.0, done / total))
-        continue
-
-    # RTT location search
-    try:
-        payload = cached_location_search(origin_crs.strip(), run_date, rtt_user, rtt_pass)
-        loc_df = flatten_location_services(payload)
-    except Exception as ex:
-        for _, row in grp.iterrows():
-            results.append({
-                **row.to_dict(),
-                "status": "FAIL",
-                "error": f"RTT location query failed: {ex}",
-                "operator": "",
-                "planned_cancel": "",
-            })
-            done += 1
-            progress.progress(min(1.0, done / total))
-        continue
-
-    # Empty services list -> fail each row in the group (but never crash)
-    if loc_df.empty:
-        for _, row in grp.iterrows():
-            results.append({
-                **row.to_dict(),
-                "status": "FAIL",
-                "error": f"No RTT services returned for origin/date (origin CRS: {origin_crs})",
-                "operator": "",
-                "planned_cancel": "",
-            })
-            done += 1
-            progress.progress(min(1.0, done / total))
-        continue
-
-    for _, row in grp.iterrows():
-        hc = str(row["headcode"]).strip()
-        exp_dep = row["dep"]
-        exp_arr = row["arr"]
-        exp_to = row["to"]
-
-        candidates = loc_df[loc_df["trainIdentity"] == hc].copy()
-        if candidates.empty:
-            results.append({
-                **row.to_dict(),
-                "status": "FAIL",
-                "error": "Headcode not found at origin on date",
-                "operator": "",
-                "planned_cancel": "",
-            })
-            done += 1
-            progress.progress(min(1.0, done / total))
+        # CRS missing -> not checked
+        if not isinstance(origin_crs, str) or not origin_crs.strip():
+            for _, row in grp.iterrows():
+                results.append({
+                    **row.to_dict(),
+                    "status": "NOT CHECKED",
+                    "error": "Origin CRS not mapped (RailReferences missing mapping / add alias)",
+                    "operator": "",
+                    "planned_cancel": "",
+                    "act_from": None,
+                    "act_to": None,
+                    "act_dep": None,
+                    "act_arr": None,
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
             continue
 
-        # Departure match (public, exact HH:MM)
-        if exp_dep:
-            candidates["dep_pub_hhmm"] = candidates["pub_dep_raw"].apply(rtt_public_to_hhmm)
-            candidates = candidates[candidates["dep_pub_hhmm"] == exp_dep]
+        # RTT location search
+        try:
+            payload = cached_location_search(origin_crs.strip(), run_date, rtt_user, rtt_pass)
+            loc_df = flatten_location_services(payload)
+        except Exception as ex:
+            for _, row in grp.iterrows():
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": f"RTT location query failed: {ex}",
+                    "operator": "",
+                    "planned_cancel": "",
+                    "act_from": None,
+                    "act_to": None,
+                    "act_dep": None,
+                    "act_arr": None,
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+            continue
+
+        if loc_df.empty:
+            for _, row in grp.iterrows():
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": f"No RTT services returned for origin/date (origin CRS: {origin_crs})",
+                    "operator": "",
+                    "planned_cancel": "",
+                    "act_from": None,
+                    "act_to": None,
+                    "act_dep": None,
+                    "act_arr": None,
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+            continue
+
+        # Check each expected row
+        for _, row in grp.iterrows():
+            hc = str(row["headcode"]).strip()
+            exp_dep = row["exp_dep"]
+
+            candidates = loc_df[loc_df["trainIdentity"] == hc].copy()
             if candidates.empty:
                 results.append({
                     **row.to_dict(),
                     "status": "FAIL",
-                    "error": "Headcode found but departure time differs (public/GBTT)",
+                    "error": "Headcode not found at origin on date",
                     "operator": "",
                     "planned_cancel": "",
+                    "act_from": None,
+                    "act_to": None,
+                    "act_dep": None,
+                    "act_arr": None,
                 })
                 done += 1
                 progress.progress(min(1.0, done / total))
                 continue
 
-        cand = candidates.iloc[0]
-        uid = cand.get("serviceUid")
-        rtt_run_date = cand.get("runDate")
-        op = cand.get("operator") or ""
-        pc = "Y" if bool(cand.get("plannedCancel", False)) else ""
+            # If PASS has dep time, filter by public departure at origin
+            if exp_dep:
+                candidates["dep_pub_hhmm"] = candidates["pub_dep_raw"].apply(rtt_public_to_hhmm)
+                candidates = candidates[candidates["dep_pub_hhmm"] == exp_dep]
+                if candidates.empty:
+                    results.append({
+                        **row.to_dict(),
+                        "status": "FAIL",
+                        "error": "Headcode found but origin departure time differs (public/GBTT)",
+                        "operator": "",
+                        "planned_cancel": "",
+                        "act_from": None,
+                        "act_to": None,
+                        "act_dep": None,
+                        "act_arr": None,
+                    })
+                    done += 1
+                    progress.progress(min(1.0, done / total))
+                    continue
 
-        if not uid or not rtt_run_date:
-            results.append({
-                **row.to_dict(),
-                "status": "FAIL",
-                "error": "Insufficient RTT data to verify destination/arrival",
-                "operator": op,
-                "planned_cancel": pc,
-            })
-            done += 1
-            progress.progress(min(1.0, done / total))
-            continue
+            cand = candidates.iloc[0]
+            uid = cand.get("serviceUid")
+            rtt_run_date = cand.get("runDate")
+            op = cand.get("operator") or ""
+            pc = "Y" if bool(cand.get("plannedCancel", False)) else ""
 
-        # Service detail: destination + public arrival
-        try:
-            detail = rtt_service_detail(uid, rtt_run_date, auth)
-            det = extract_dest_public(detail)
-        except Exception:
-            results.append({
-                **row.to_dict(),
-                "status": "FAIL",
-                "error": "RTT service detail lookup failed",
-                "operator": op,
-                "planned_cancel": pc,
-            })
-            done += 1
-            progress.progress(min(1.0, done / total))
-            continue
-
-        det_dest = det.get("dest_name") or ""
-        if exp_to and det_dest:
-            # name-based match (simple and transparent)
-            if norm_name(exp_to) not in norm_name(det_dest) and norm_name(det_dest) not in norm_name(exp_to):
+            if not uid or not rtt_run_date:
                 results.append({
                     **row.to_dict(),
                     "status": "FAIL",
-                    "error": f"Destination differs (RTT: {det_dest})",
+                    "error": "Insufficient RTT data to verify calling points",
                     "operator": op,
                     "planned_cancel": pc,
+                    "act_from": None,
+                    "act_to": None,
+                    "act_dep": None,
+                    "act_arr": None,
                 })
                 done += 1
                 progress.progress(min(1.0, done / total))
                 continue
 
-        rtt_arr_hhmm = rtt_public_to_hhmm(det.get("arr_pub_raw"))
-        if exp_arr and rtt_arr_hhmm:
-            if exp_arr != rtt_arr_hhmm:
+            # Service detail: find PASS FROM/TO within calling points and compare dep/arr there
+            try:
+                detail = rtt_service_detail(uid, rtt_run_date, auth)
+                seg = extract_segment_times(detail, row["exp_from"], row["exp_to"])
+            except Exception:
                 results.append({
                     **row.to_dict(),
                     "status": "FAIL",
-                    "error": f"Arrival time differs (public/GBTT, RTT: {rtt_arr_hhmm})",
+                    "error": "RTT service detail lookup failed",
                     "operator": op,
                     "planned_cancel": pc,
+                    "act_from": None,
+                    "act_to": None,
+                    "act_dep": None,
+                    "act_arr": None,
                 })
                 done += 1
                 progress.progress(min(1.0, done / total))
                 continue
 
-        results.append({
-            **row.to_dict(),
-            "status": "OK",
-            "error": "",
-            "operator": op,
-            "planned_cancel": pc,
-        })
-        done += 1
-        progress.progress(min(1.0, done / total))
+            if not seg["from_found"]:
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": "FROM location not found within RTT service calling points",
+                    "operator": op,
+                    "planned_cancel": pc,
+                    "act_from": seg["act_from"],
+                    "act_to": seg["act_to"],
+                    "act_dep": seg["act_dep"],
+                    "act_arr": seg["act_arr"],
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
 
-progress.empty()
+            if not seg["to_found"]:
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": "TO location not found within RTT service calling points",
+                    "operator": op,
+                    "planned_cancel": pc,
+                    "act_from": seg["act_from"],
+                    "act_to": seg["act_to"],
+                    "act_dep": seg["act_dep"],
+                    "act_arr": seg["act_arr"],
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
 
-report = pd.DataFrame(results)
-if report.empty:
-    st.warning("No results produced (unexpected). Check inputs and try again.")
+            # Compare dep at FROM
+            if row["exp_dep"] and seg["act_dep"] and row["exp_dep"] != seg["act_dep"]:
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": f"Departure mismatch at FROM (RTT: {seg['act_dep']})",
+                    "operator": op,
+                    "planned_cancel": pc,
+                    "act_from": seg["act_from"],
+                    "act_to": seg["act_to"],
+                    "act_dep": seg["act_dep"],
+                    "act_arr": seg["act_arr"],
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
+
+            # Compare arr at TO
+            if row["exp_arr"] and seg["act_arr"] and row["exp_arr"] != seg["act_arr"]:
+                results.append({
+                    **row.to_dict(),
+                    "status": "FAIL",
+                    "error": f"Arrival mismatch at TO (RTT: {seg['act_arr']})",
+                    "operator": op,
+                    "planned_cancel": pc,
+                    "act_from": seg["act_from"],
+                    "act_to": seg["act_to"],
+                    "act_dep": seg["act_dep"],
+                    "act_arr": seg["act_arr"],
+                })
+                done += 1
+                progress.progress(min(1.0, done / total))
+                continue
+
+            results.append({
+                **row.to_dict(),
+                "status": "OK",
+                "error": "",
+                "operator": op,
+                "planned_cancel": pc,
+                "act_from": seg["act_from"],
+                "act_to": seg["act_to"],
+                "act_dep": seg["act_dep"],
+                "act_arr": seg["act_arr"],
+            })
+            done += 1
+            progress.progress(min(1.0, done / total))
+
+    progress.empty()
+    report = pd.DataFrame(results)
+    st.session_state["report"] = report  # persist for export without rerun
+else:
+    report = existing_report
+
+if report is None or report.empty:
+    st.warning("No report available. Click 'Run RTT check' to generate one.")
     st.stop()
 
+# Outcome summary
 ok = report[report["status"] == "OK"]
 fail = report[report["status"] == "FAIL"]
 nc = report[report["status"] == "NOT CHECKED"]
 
-st.subheader("Outcome message")
+st.subheader("Outcome")
 st.write(f"Checked: **{len(report)}** | OK: **{len(ok)}** | Errors: **{len(fail)}** | Not checked: **{len(nc)}**")
 
 if len(fail) == 0 and len(nc) == 0:
     st.success("All trains are running as booked (public/GBTT) for the selected date range.")
 else:
-    st.error("Some trains did not match public/GBTT details, or could not be checked. You can create a CSV report.")
+    st.error("Some checks failed or could not be performed. Review the table below and export CSV if needed.")
+
+# Requested diagnostic view: what issues app finds
+st.subheader("What the app found (expected vs RTT actual)")
+view_cols = [
+    "date",
+    "headcode",
+    "exp_dep", "act_dep",
+    "exp_from", "act_from",
+    "exp_to", "act_to",
+    "exp_arr", "act_arr",
+    "status", "error",
+    "diagram_info",
+]
+view_cols = [c for c in view_cols if c in report.columns]
+st.dataframe(
+    report[view_cols].sort_values(["date", "headcode", "exp_dep"], na_position="last"),
+    use_container_width=True
+)
 
 with st.expander("Trains running as booked (simplified)"):
     simp = ok.copy()
-    simp["line"] = simp.apply(
-        lambda r: f"{r['date']} {r['headcode']} {r['dep']} {r['from']} - {r['to']} {r['arr']}",
-        axis=1
-    )
-    lines = simp.sort_values(["date", "dep", "headcode"])["line"].tolist()
-    st.write("\n".join(lines) if lines else "None")
+    if not simp.empty:
+        simp["line"] = simp.apply(
+            lambda r: f"{r['date']} {r['headcode']} {r['exp_dep']} {r['exp_from']} - {r['exp_to']} {r['exp_arr']}",
+            axis=1
+        )
+        st.write("\n".join(simp.sort_values(["date", "exp_dep", "headcode"])["line"].tolist()))
+    else:
+        st.write("None")
 
 with st.expander("Errors / not checked (details)"):
     bad = report[report["status"] != "OK"].copy()
@@ -663,23 +765,37 @@ with st.expander("Errors / not checked (details)"):
         st.write("None")
     else:
         st.dataframe(
-            bad[["date", "headcode", "from", "to", "dep", "arr", "status", "error", "diagram_info", "operator", "planned_cancel"]]
-            .sort_values(["date", "status", "dep", "headcode"]),
+            bad[view_cols].sort_values(["date", "status", "headcode"], na_position="last"),
             use_container_width=True
         )
 
+# Export without rerun (uses session_state report)
 st.subheader("CSV report")
-st.write("Would you like to create a CSV report?")
-create_csv = st.checkbox("Yes, create CSV report", value=False)
+st.write("Tick to create a CSV report from the latest run (no re-run needed).")
+create_csv = st.checkbox("Create CSV report", value=False)
 
 if create_csv:
     out = report.copy()
-    # For OK rows, keep simplified (no error/diagram needed)
+
+    # If OK rows -> simplified (blank error/diagram)
     out.loc[out["status"] == "OK", "error"] = ""
     out.loc[out["status"] == "OK", "diagram_info"] = ""
 
-    cols_out = ["date", "headcode", "from", "to", "dep", "arr", "status", "error", "diagram_info", "operator", "planned_cancel"]
-    csv_bytes = out[cols_out].to_csv(index=False).encode("utf-8")
+    csv_cols = [
+        "date",
+        "headcode",
+        "exp_from", "act_from",
+        "exp_dep", "act_dep",
+        "exp_to", "act_to",
+        "exp_arr", "act_arr",
+        "status",
+        "error",
+        "diagram_info",
+        "operator",
+        "planned_cancel",
+    ]
+    csv_cols = [c for c in csv_cols if c in out.columns]
+    csv_bytes = out[csv_cols].to_csv(index=False).encode("utf-8")
 
     st.download_button(
         "Download CSV report",
